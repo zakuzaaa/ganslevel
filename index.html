@@ -1,0 +1,666 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>🔫 Автомат — браузерная игра</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background: radial-gradient(circle at 10% 10%, #081025 0%, #000814 50%, #000000 100%);
+    color:#fff;
+    font-family:Inter, system-ui, Arial;
+    -webkit-font-smoothing:antialiased;
+    overflow:hidden;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+  }
+  canvas{display:block; width:100vw; height:100vh}
+  #ui {
+    position:fixed;
+    left:12px;
+    top:12px;
+    z-index:20;
+    display:flex;
+    gap:12px;
+    align-items:center;
+    pointer-events:none;
+  }
+  .panel{
+    background:rgba(255,255,255,0.05);
+    padding:8px 12px;
+    border-radius:10px;
+    backdrop-filter:blur(6px);
+    pointer-events:auto;
+  }
+  #controls{
+    position:fixed;
+    bottom:18px;
+    left:0;right:0;
+    display:flex;
+    justify-content:center;
+    gap:16px;
+    pointer-events:auto;
+  }
+  .btn{
+    width:72px;height:72px;border-radius:50%;border:none;background:linear-gradient(180deg,#ffffff10,#00000010);color:#fff;font-size:22px;
+    display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px);
+  }
+  .small {
+    font-size:14px;color:#cfe8ff;
+  }
+  @media(min-width:900px){ #controls{display:none} }
+  @media(max-width:900px){ .panel{font-size:14px} }
+  /* Crosshair for desktop (not interfering with pointer events) */
+  #crosshair{
+    position:fixed;
+    width:28px;height:28px;left:50%;top:50%;
+    margin-left:-14px;margin-top:-14px;pointer-events:none;z-index:15;
+    mix-blend-mode:screen;opacity:0.9;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="ui">
+  <div class="panel small" id="score">Счёт: 0</div>
+  <div class="panel small" id="ammo">Патроны: 30 / 120</div>
+  <div class="panel small" id="level">Уровень: 1</div>
+</div>
+
+<!-- mobile controls -->
+<div id="controls">
+  <button class="btn" id="left">⬅</button>
+  <button class="btn" id="fire">FIRE</button>
+  <button class="btn" id="right">➡</button>
+  <button class="btn" id="reload">🔁</button>
+</div>
+
+<!-- desktop crosshair -->
+<svg id="crosshair" viewBox="0 0 36 36">
+  <circle cx="18" cy="18" r="6" stroke="#4dd0e1" stroke-width="1.6" fill="rgba(77,208,225,0.06)"></circle>
+  <path d="M17 0v6M17 30v6M0 17h6M30 17h6" stroke="#4dd0e1" stroke-width="1.2" stroke-linecap="round"/>
+</svg>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d', { alpha: true });
+
+  function resize(){
+    canvas.width = innerWidth * devicePixelRatio;
+    canvas.height = innerHeight * devicePixelRatio;
+    canvas.style.width = innerWidth + 'px';
+    canvas.style.height = innerHeight + 'px';
+    ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+  }
+  addEventListener('resize', resize);
+  resize();
+
+  // UI
+  const scoreEl = document.getElementById('score');
+  const ammoEl = document.getElementById('ammo');
+  const levelEl = document.getElementById('level');
+
+  // Game state
+  const player = {
+    x: innerWidth / 2,
+    y: innerHeight - 100,
+    baseY: innerHeight - 100,
+    width: 120,
+    height: 36,
+    aimX: innerWidth / 2,
+    aimY: innerHeight / 2,
+    recoil: 0
+  };
+
+  let score = 0;
+  let level = 1;
+
+  // Ammo / reload
+  const clipSize = 30;
+  let ammo = clipSize;
+  let reserve = 120;
+  let reloading = false;
+
+  // Bullets
+  const bullets = []; // {x,y,dx,dy,spd,ttl}
+
+  // Casings (gild)
+  const casings = [];
+
+  // Enemies (drones/targets)
+  const enemies = []; // {x,y,w,h,hp,type,angle,spin,vel}
+
+  // Particles
+  const particles = [];
+
+  // Timing
+  let lastShot = 0;
+  const fireRate = 100; // ms between shots
+  let lastTime = performance.now();
+  let gameOver = false;
+
+  // Audio: basic WebAudio effects for shot and reload
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  const audioCtx = AudioCtx ? new AudioCtx() : null;
+  function playShot(){
+    if(!audioCtx) return;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = 'sawtooth';
+    o.frequency.value = 1200;
+    g.gain.value = 0.08;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start();
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.12);
+    o.stop(audioCtx.currentTime + 0.13);
+  }
+  function playReload(){
+    if(!audioCtx) return;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = 'triangle';
+    o.frequency.value = 220;
+    g.gain.value = 0.06;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start();
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
+    o.stop(audioCtx.currentTime + 0.52);
+  }
+  function playHit(){
+    if(!audioCtx) return;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = 'square';
+    o.frequency.value = 300;
+    g.gain.value = 0.05;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start();
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.12);
+    o.stop(audioCtx.currentTime + 0.13);
+  }
+
+  // Helpers
+  function rand(a,b){ return a + Math.random()*(b-a); }
+  function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
+
+  // Spawn enemies periodically; difficulty scales with level
+  let enemyTimer = 0;
+  function spawnEnemy(){
+    const w = 40 + Math.random()*40;
+    const h = 26 + Math.random()*20;
+    const x = rand(w/2, innerWidth - w/2);
+    const speed = 0.6 + Math.random()* (0.8 + level*0.15);
+    const hp = 1 + Math.floor(level/3);
+    enemies.push({
+      x, y: -40,
+      w, h,
+      hp,
+      vel: speed,
+      angle: 0,
+      spin: (Math.random()-0.5) * 0.04,
+      type: Math.random() < 0.2 ? 'fast' : 'basic'
+    });
+  }
+
+  // Shooting
+  function tryFire(now){
+    if(reloading || gameOver) return;
+    if(now - lastShot < fireRate) return;
+    if(ammo <= 0){ // auto reload if empty
+      beginReload();
+      return;
+    }
+    lastShot = now;
+    ammo--;
+    score += 0; // no score on shot
+    // bullet direction toward aim point
+    const sx = player.x;
+    const sy = player.y - 10;
+    const dx = player.aimX - sx;
+    const dy = player.aimY - sy;
+    const mag = Math.hypot(dx,dy) || 1;
+    const spd = 18;
+    const vx = dx/mag * spd * (1 + (Math.random()-0.5)*0.02);
+    const vy = dy/mag * spd * (1 + (Math.random()-0.5)*0.02);
+    bullets.push({x:sx,y:sy,dx:vx,dy:vy,ttl:120});
+    // muzzle flash particle
+    for(let i=0;i<6;i++){
+      particles.push({
+        x: sx + (Math.random()-0.5)*8,
+        y: sy + (Math.random()-0.5)*8,
+        vx: (Math.random()-0.5)*3 + vx*0.03,
+        vy: (Math.random()-0.5)*3 + vy*0.03,
+        ttl: 18 + Math.random()*6,
+        size: 2 + Math.random()*3,
+        col: i<2? 'rgba(255,235,120,0.9)' : 'rgba(255,120,40,0.9)'
+      });
+    }
+    // casing ejection
+    casings.push({
+      x: sx - 10,
+      y: sy + 4,
+      vx: -3 + Math.random()*-2,
+      vy: -1 + Math.random()*-1.4,
+      rot: Math.random()*Math.PI,
+      drot: (Math.random()-0.5)*0.3,
+      ttl: 80
+    });
+
+    // recoil
+    player.recoil = 8;
+
+    playShot();
+    updateUI();
+  }
+
+  function beginReload(){
+    if(reloading || ammo === clipSize || reserve === 0) return;
+    reloading = true;
+    playReload();
+    setTimeout(()=>{ // reload time (ms)
+      const need = clipSize - ammo;
+      const take = Math.min(need, reserve);
+      ammo += take;
+      reserve -= take;
+      reloading = false;
+      updateUI();
+    }, 800);
+    updateUI();
+  }
+
+  // Collision detection simple AABB / point-vs-circle for bullets -> enemy
+  function checkCollisions(){
+    // bullets
+    for(let i = bullets.length-1; i>=0; i--){
+      const b = bullets[i];
+      // move handled elsewhere
+      // check against enemies
+      for(let j = enemies.length-1; j>=0; j--){
+        const e = enemies[j];
+        // approximate enemy as rectangle; bullet point collision
+        if(b.x > e.x - e.w/2 && b.x < e.x + e.w/2 && b.y > e.y - e.h/2 && b.y < e.y + e.h/2){
+          // hit
+          bullets.splice(i,1);
+          e.hp -= 1;
+          // hit particles
+          for(let k=0;k<10;k++){
+            particles.push({
+              x: b.x,
+              y: b.y,
+              vx: (Math.random()-0.5)*4,
+              vy: (Math.random()-0.5)*4,
+              ttl: 30 + Math.random()*20,
+              size: 1 + Math.random()*3,
+              col: 'rgba(255,200,120,0.9)'
+            });
+          }
+          playHit();
+          if(e.hp <= 0){
+            // explosion + score
+            score += 10 + Math.floor(level*2);
+            for(let k=0;k<20;k++){
+              particles.push({
+                x: e.x,
+                y: e.y,
+                vx: (Math.random()-0.5)*6,
+                vy: (Math.random()-0.5)*6,
+                ttl: 40 + Math.random()*40,
+                size: 2 + Math.random()*4,
+                col: Math.random()<0.5 ? 'rgba(255,160,40,0.95)' : 'rgba(255,220,120,0.9)'
+              });
+            }
+            enemies.splice(j,1);
+            // small chance to drop ammo or reserve
+            if(Math.random() < 0.12){
+              reserve = Math.min(300, reserve + 10 + Math.floor(Math.random()*20));
+            }
+            updateUI();
+          }
+          break;
+        }
+      }
+    }
+
+    // enemies reaching bottom -> penalty
+    for(let i = enemies.length-1; i>=0; i--){
+      if(enemies[i].y - enemies[i].h/2 > innerHeight + 20){
+        enemies.splice(i,1);
+        score = Math.max(0, score - 5);
+        updateUI();
+      }
+    }
+  }
+
+  // Update & Render loop
+  function update(now){
+    const dt = (now - lastTime) / 1000;
+    lastTime = now;
+
+    // spawn control
+    enemyTimer += dt;
+    const spawnInterval = Math.max(0.4, 1.6 - level*0.08); // faster as level rises
+    if(enemyTimer > spawnInterval){
+      enemyTimer = 0;
+      spawnEnemy();
+    }
+
+    // update bullets
+    for(let i = bullets.length-1; i>=0; i--){
+      const b = bullets[i];
+      b.x += b.dx * dt * 60/1;
+      b.y += b.dy * dt * 60/1;
+      b.ttl--;
+      if(b.ttl <= 0 || b.x < -50 || b.x > innerWidth + 50 || b.y < -50 || b.y > innerHeight + 50) bullets.splice(i,1);
+    }
+
+    // update casings
+    for(let i = casings.length-1; i>=0; i--){
+      const c = casings[i];
+      c.x += c.vx;
+      c.y += c.vy;
+      c.vy += 0.12; // gravity
+      c.vx *= 0.995;
+      c.y = Math.min(c.y, innerHeight - 8);
+      c.rot += c.drot;
+      c.ttl--;
+      if(c.ttl <= 0) casings.splice(i,1);
+    }
+
+    // update enemies
+    for(let e of enemies){
+      e.y += e.vel * (e.type==='fast' ? 1.6 : 1) * dt * 60;
+      e.angle += e.spin;
+      // simple lateral sway
+      e.x += Math.sin(now/1000 + e.x) * 0.1;
+    }
+
+    // update particles
+    for(let i = particles.length-1; i>=0; i--){
+      const p = particles[i];
+      p.x += p.vx;
+      p.y += p.vy;
+      p.vy += 0.06;
+      p.ttl--;
+      if(p.ttl <= 0) particles.splice(i,1);
+    }
+
+    // recoil decay
+    if(player.recoil > 0) player.recoil *= 0.85;
+    if(player.recoil < 0.03) player.recoil = 0;
+
+    // collisions
+    checkCollisions();
+
+    // level up logic
+    if(score > level * 100){
+      level++;
+      levelEl.textContent = 'Уровень: ' + level;
+    }
+
+    render();
+
+    if(!gameOver) requestAnimationFrame(update);
+  }
+
+  function render(){
+    // clear
+    ctx.clearRect(0,0,innerWidth,innerHeight);
+
+    // background stars / subtle gradient
+    drawBackground();
+
+    // draw particles (behind)
+    for(let p of particles){
+      ctx.fillStyle = p.col;
+      ctx.globalAlpha = clamp(p.ttl/40,0,1);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // draw enemies
+    for(let e of enemies){
+      ctx.save();
+      ctx.translate(e.x, e.y);
+      ctx.rotate(e.angle);
+      // body with gradient
+      const g = ctx.createLinearGradient(-e.w/2, -e.h/2, e.w/2, e.h/2);
+      g.addColorStop(0,'#8fa7b8');
+      g.addColorStop(0.5,'#cfe8ff');
+      g.addColorStop(1,'#7a8ea0');
+      ctx.fillStyle = g;
+      // slight jagged outline
+      ctx.beginPath();
+      ctx.moveTo(-e.w/2, -e.h/2);
+      ctx.quadraticCurveTo(0, -e.h/2 - 6, e.w/2, -e.h/2);
+      ctx.lineTo(e.w/2, e.h/2);
+      ctx.lineTo(-e.w/2, e.h/2);
+      ctx.closePath();
+      ctx.fill();
+      // window / eye
+      ctx.fillStyle = '#083e66';
+      ctx.beginPath();
+      ctx.ellipse(e.w*0.1, -e.h*0.1, e.w*0.18, e.h*0.3, 0, 0, Math.PI*2);
+      ctx.fill();
+      // HP bar
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
+      ctx.fillRect(-e.w/2, e.h/2 + 4, e.w, 6);
+      ctx.fillStyle = '#76ff03';
+      ctx.fillRect(-e.w/2, e.h/2 + 4, e.w * (e.hp / (1 + Math.floor(level/3))), 6);
+      ctx.restore();
+    }
+
+    // draw bullets (bright)
+    for(let b of bullets){
+      ctx.fillStyle = '#9be7ff';
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, 3, 0, Math.PI*2);
+      ctx.fill();
+      // trail
+      ctx.strokeStyle = 'rgba(155,231,255,0.12)';
+      ctx.beginPath();
+      ctx.moveTo(b.x - b.dx*0.02, b.y - b.dy*0.02);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
+
+    // draw casings
+    for(let c of casings){
+      ctx.save();
+      ctx.translate(c.x, c.y);
+      ctx.rotate(c.rot);
+      ctx.fillStyle = 'rgba(212,175,55,0.95)';
+      ctx.fillRect(-4,-1,8,2);
+      ctx.restore();
+    }
+
+    // draw player weapon at bottom center
+    drawWeapon();
+
+    // HUD text (update elements)
+    scoreEl.textContent = 'Счёт: ' + score;
+    ammoEl.textContent = 'Патроны: ' + (reloading ? '...':'') + ammo + ' / ' + reserve;
+    levelEl.textContent = 'Уровень: ' + level;
+  }
+
+  function drawBackground(){
+    // subtle vignette
+    const g = ctx.createRadialGradient(innerWidth*0.5, innerHeight*0.5, innerWidth*0.1, innerWidth*0.5, innerHeight*0.5, innerWidth);
+    g.addColorStop(0,'rgba(6,18,32,0.1)');
+    g.addColorStop(1,'rgba(0,0,0,0.6)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,innerWidth,innerHeight);
+
+    // moving stars
+    const base = Math.min(150, Math.floor(60 + level*3));
+    for(let i=0;i<base;i++){
+      const x = (i * 9973) % innerWidth + Math.sin((i*43 + performance.now()/50)/100)*30;
+      const y = ((i * 1337) % innerHeight + (performance.now()/20)%innerHeight);
+      const s = 0.6 + ((i%7)/7);
+      ctx.fillStyle = 'rgba(255,255,255,0.03)';
+      ctx.fillRect(x, (y + i) % innerHeight, s, s);
+    }
+  }
+
+  function drawWeapon(){
+    // weapon pivot near bottom center
+    const px = player.x;
+    const py = player.y;
+
+    // aim vector
+    const ax = player.aimX;
+    const ay = player.aimY;
+    const ang = Math.atan2(ay - py, ax - px);
+
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.rotate(ang + Math.PI/2);
+
+    // recoil translate (backwards along barrel)
+    ctx.translate(0, player.recoil * -0.6);
+
+    // weapon body
+    const bw = 120;
+    const bh = 28;
+    // body gradient
+    const g = ctx.createLinearGradient(-bw/2, -bh/2, bw/2, bh/2);
+    g.addColorStop(0,'#2b3b45');
+    g.addColorStop(0.5,'#5f6f77');
+    g.addColorStop(1,'#1b2a30');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.roundRect(-bw/2, -bh/2, bw, bh, 8);
+    ctx.fill();
+
+    // barrel
+    ctx.fillStyle = '#0b1316';
+    ctx.fillRect(-12, -bh/2 - 36, 24, 36);
+
+    // muzzle (front)
+    ctx.fillStyle = '#0f2126';
+    ctx.fillRect(-9, -bh/2 - 44, 18, 8);
+
+    // mag
+    ctx.fillStyle = '#0f1920';
+    ctx.fillRect(12, -4, 12, 28);
+
+    // some highlights
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(-bw/2+1, -bh/2+1, bw-2, bh-2);
+
+    // muzzle flash (if recently shot)
+    if(player.recoil > 0.05){
+      const flashAlpha = clamp(player.recoil/8, 0, 1);
+      const flashLen = 18 + Math.random()*8;
+      ctx.save();
+      ctx.translate(0, -bh/2 - 44);
+      for(let i=0;i<6;i++){
+        ctx.fillStyle = `rgba(255,${180 + Math.random()*60},${60 + Math.random()*60},${0.12 * flashAlpha})`;
+        ctx.beginPath();
+        ctx.moveTo((Math.random()-0.5)*6, 0);
+        ctx.lineTo((Math.random()-0.5)*6, -flashLen - Math.random()*8);
+        ctx.lineTo((Math.random()-0.5)*6 + 4, -flashLen/2);
+        ctx.closePath();
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    ctx.restore();
+  }
+
+  // Helpers to make rounded rect for older contexts
+  if(!CanvasRenderingContext2D.prototype.roundRect){
+    CanvasRenderingContext2D.prototype.roundRect = function(x, y, w, h, r){
+      if(typeof r === 'number') r = {tl:r,tr:r,br:r,bl:r};
+      this.beginPath();
+      this.moveTo(x + r.tl, y);
+      this.arcTo(x + w, y, x + w, y + h, r.tr);
+      this.arcTo(x + w, y + h, x, y + h, r.br);
+      this.arcTo(x, y + h, x, y, r.bl);
+      this.arcTo(x, y, x + w, y, r.tl);
+      this.closePath();
+      return this;
+    };
+  }
+
+  // Input handlers
+  const pointer = {down:false, x: player.aimX, y: player.aimY};
+  window.addEventListener('pointermove', (e)=>{
+    // unlock audio on first gesture
+    if(audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(()=>{});
+    pointer.x = e.clientX;
+    pointer.y = e.clientY;
+    player.aimX = pointer.x;
+    player.aimY = pointer.y;
+    // move player horizontally toward aim when touching left/right buttons or touch drag near bottom
+    if(pointer.down && (e.pointerType === 'touch')){
+      // allow sliding weapon
+      player.x = clamp(e.clientX, 60, innerWidth - 60);
+    }
+    // update crosshair position (desktop)
+    const ch = document.getElementById('crosshair');
+    ch.style.left = (pointer.x - 14) + 'px';
+    ch.style.top = (pointer.y - 14) + 'px';
+  });
+  window.addEventListener('pointerdown', (e)=>{
+    pointer.down = true;
+    // left click / touch -> fire
+    if(e.button === 0 || e.pointerType === 'touch'){
+      tryFire(performance.now());
+    }
+  });
+  window.addEventListener('pointerup', (e)=>{
+    pointer.down = false;
+  });
+
+  // keyboard for desktop
+  window.addEventListener('keydown', (e)=>{
+    if(e.code === 'Space'){
+      tryFire(performance.now());
+      e.preventDefault();
+    } else if(e.code === 'KeyR'){
+      beginReload();
+    } else if(e.code === 'ArrowLeft'){
+      player.x -= 14;
+      player.x = clamp(player.x, 40, innerWidth - 40);
+    } else if(e.code === 'ArrowRight'){
+      player.x += 14;
+      player.x = clamp(player.x, 40, innerWidth - 40);
+    }
+  });
+
+  // mobile control buttons
+  document.getElementById('left').addEventListener('pointerdown', ()=>{ player.x -= 10; });
+  document.getElementById('right').addEventListener('pointerdown', ()=>{ player.x += 10; });
+  document.getElementById('fire').addEventListener('pointerdown', (e)=>{ tryFire(performance.now()); });
+  document.getElementById('reload').addEventListener('pointerdown', ()=>{ beginReload(); });
+
+  // update UI elements
+  function updateUI(){
+    scoreEl.textContent = 'Счёт: ' + score;
+    ammoEl.textContent = 'Патроны: ' + (reloading ? '...' : ammo) + ' / ' + reserve;
+    levelEl.textContent = 'Уровень: ' + level;
+  }
+
+  // Start game loop
+  lastTime = performance.now();
+  update(lastTime);
+
+  // expose some debug actions (optional)
+  window.__game = {
+    addEnemy: spawnEnemy,
+    incScore: ()=>{ score += 50; updateUI(); }
+  };
+
+})();
+</script>
+</body>
+</html>
